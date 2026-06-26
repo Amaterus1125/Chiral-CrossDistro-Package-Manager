@@ -1,10 +1,10 @@
 #!/bin/bash
 set -e
 
-# ─────────────────────────────────────────────────────────────────────────────
+
 # Chiral Package Manager — Installer
 # Usage: curl -sSL https://raw.githubusercontent.com/Amaterus1125/chpm/main/install.sh | bash
-# ─────────────────────────────────────────────────────────────────────────────
+
 
 REPO="https://github.com/Amaterus1125/chpm"
 BINARY_URL="https://github.com/Amaterus1125/chpm/releases/latest/download/chiral-x86_64-linux"
@@ -39,7 +39,7 @@ fi
 # Make it executable
 chmod +x "$INSTALL_DIR/chiral"
 
-echo "✅ Chiral installed to $INSTALL_DIR/chiral"
+echo "Chiral installed to $INSTALL_DIR/chiral"
 
 # Check if install dir is in PATH
 if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
