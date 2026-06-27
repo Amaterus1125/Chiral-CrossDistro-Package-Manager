@@ -1,18 +1,19 @@
 use chiral::ui::ChiralUI;
-use chiral::{install_binary, remove_binary, update_binary, search_packages, list_installed, info_package};
+use chiral::{install_binary, remove_binary, update_binary, search_packages, list_installed, info_package, show_deps};
 use std::env;
 
 fn print_help() {
     println!("Chiral Package Manager v2.0");
     println!();
     println!("Usage:");
-    println!("  chiral install <package>     Install a package");
+    println!("  chiral install <package>     Install a package and its dependencies");
     println!("  chiral remove  <package>     Remove an installed package");
     println!("  chiral update  <package>     Update a package to latest version");
     println!("  chiral upgrade               Update all installed packages");
     println!("  chiral search  <query>       Search available packages");
     println!("  chiral list                  List installed packages");
-    println!("  chiral info    <package>     Show version, source and files for a package");
+    println!("  chiral info    <package>     Show version, source, deps and files");
+    println!("  chiral deps    <package>     Show what would be installed (dry run)");
 }
 
 fn main() {
@@ -51,6 +52,10 @@ fn main() {
         "info" => {
             if args.len() < 3 { eprintln!("Usage: chiral info <package>"); std::process::exit(1); }
             info_package(&args[2])
+        }
+        "deps" => {
+            if args.len() < 3 { eprintln!("Usage: chiral deps <package>"); std::process::exit(1); }
+            show_deps(&args[2])
         }
         _ => {
             eprintln!("Unknown command: {}", args[1]);
