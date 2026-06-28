@@ -1250,3 +1250,62 @@ pub fn show_deps(package: &str) -> Result<(), String> {
     println!("Then: {}", package);
     Ok(())
 }
+
+
+/// chiral self-update — downloads latest binary from GitHub releases
+pub fn self_update() -> Result<(), String> {
+    const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+    const RELEASES_API: &str = "https://api.github.com/repos/Amaterus1125/Chiral-CrossDistro-Package-Manager/releases/latest";
+
+    println!("Current version: v{}", CURRENT_VERSION);
+    println!("Checking for updates...");
+
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get(RELEASES_API)
+        .header("User-Agent", "chiral-package-manager")
+        .send()
+        .map_err(|e| format!("Network error: {}", e))?
+        .text()
+        .map_err(|e| e.to_string())?;
+
+    let json: serde_json::Value = serde_json::from_str(&resp)
+        .map_err(|e| format!("Parse error: {}", e))?;
+
+    let latest = json["tag_name"]
+        .as_str()
+        .ok_or("Could not get latest version")?
+        .trim_start_matches('v');
+
+    if latest == CURRENT_VERSION {
+        println!("Already up to date (v{}).", CURRENT_VERSION);
+        return Ok(());
+    }
+
+    println!("New version available: v{} → updating...", latest);
+
+    let assets = json["assets"].as_array()
+        .ok_or("No assets in release")?;
+
+    let binary_url = assets.iter()
+        .find(|a| a["name"].as_str().unwrap_or("") == "chiral")
+        .and_then(|a| a["browser_download_url"].as_str())
+        .ok_or("No 'chiral' binary found in release assets")?
+        .to_string();
+
+    let tmp = std::env::temp_dir().join("chiral-new");
+    download(&binary_url, &tmp)?;
+
+    std::fs::set_permissions(&tmp,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .map_err(|e| e.to_string())?;
+
+    let current = std::env::current_exe()
+        .map_err(|e| format!("Cannot find current binary: {}", e))?;
+
+    std::fs::rename(&tmp, &current)
+        .map_err(|e| format!("Cannot replace binary (try sudo): {}", e))?;
+
+    println!("✓ Updated to v{} — restart chiral to use new version.", latest);
+    Ok(())
+}
