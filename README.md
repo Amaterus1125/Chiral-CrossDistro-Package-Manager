@@ -10,7 +10,7 @@
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-lightgrey?style=flat-square&logo=linux)](https://kernel.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
-[![Actions](https://img.shields.io/github/actions/workflow/status/Amaterus1125/Chiral-CrossDistro-Package-Manager/sync.yml?label=auto-sync&style=flat-square)](https://github.com/Amaterus1125/Chiral-CrossDistro-Package-Manager/actions)
+
 
 </div>
 
