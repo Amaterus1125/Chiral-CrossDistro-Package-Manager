@@ -1,5 +1,5 @@
 use chiral::ui::ChiralUI;
-use chiral::{install_binary, remove_binary, update_binary, search_packages, list_installed, info_package, show_deps};
+use chiral::{install_binary, remove_binary, update_binary, search_packages, list_installed, info_package, show_deps, self_update};
 use std::env;
 
 fn print_help() {
@@ -14,6 +14,7 @@ fn print_help() {
     println!("  chiral list                  List installed packages");
     println!("  chiral info    <package>     Show version, source, deps and files");
     println!("  chiral deps    <package>     Show what would be installed (dry run)");
+    println!("  chiral self-update           Update chiral itself to latest version");
 }
 
 fn main() {
@@ -56,6 +57,9 @@ fn main() {
         "deps" => {
             if args.len() < 3 { eprintln!("Usage: chiral deps <package>"); std::process::exit(1); }
             show_deps(&args[2])
+        }
+        "self-update" => {
+            self_update()
         }
         _ => {
             eprintln!("Unknown command: {}", args[1]);
