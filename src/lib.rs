@@ -1296,7 +1296,7 @@ pub fn self_update() -> Result<(), String> {
         .ok_or("No 'chiral' binary found in release assets")?
         .to_string();
 
-    let tmp = std::env::temp_dir().join("chiral-new");
+    let tmp = PathBuf::from("/var/tmp/chiral-new");
     download(&binary_url, &tmp)?;
 
     std::fs::set_permissions(&tmp,
