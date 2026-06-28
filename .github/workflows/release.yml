@@ -1,5 +1,4 @@
-git add .
-git commit -m "your changes"
+
 git tag v3.2.0
 git push origin main
 git push origin v3.2.0
