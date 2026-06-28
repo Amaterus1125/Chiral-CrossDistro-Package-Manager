@@ -6,8 +6,8 @@ set -e
 # Usage: curl -sSL https://raw.githubusercontent.com/Amaterus1125/chpm/main/install.sh | bash
 
 
-REPO="https://github.com/Amaterus1125/chpm"
-BINARY_URL="https://github.com/Amaterus1125/chpm/releases/latest/download/chiral-x86_64-linux"
+REPO="https://github.com/Amaterus1125/Chiral-CrossDistro-Package-Manager"
+BINARY_URL="https://github.com/Amaterus1125/chpm/releases/latest/download/chiral"
 INSTALL_DIR="$HOME/.local/bin"
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
