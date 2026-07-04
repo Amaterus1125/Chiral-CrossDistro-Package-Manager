@@ -3,17 +3,28 @@ pub mod ui;
 use flate2::read::GzDecoder;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tar::Archive;
 use crate::ui::ChiralUI;
 
-// Package repositories
+
+// Constants
 
 
-const SERVER: &str = "https://raw.githubusercontent.com/Amaterus1125/chpm/main/packages";
-const ARCH_MIRROR: &str = "https://mirror.rackspace.com/archlinux";
+const SERVER: &str       = "https://raw.githubusercontent.com/Amaterus1125/chpm/main/packages";
+const ARCH_MIRROR: &str  = "https://mirror.rackspace.com/archlinux";
+const RELEASES_API: &str = "https://api.github.com/repos/Amaterus1125/Chiral-CrossDistro-Package-Manager/releases/latest";
+
+/// Packages that are fundamental to every Linux system and must NEVER be
+/// downloaded from Arch/Debian — they conflict with LFS filesystem layout.
+const NEVER_INSTALL: &[&str] = &[
+    "filesystem", "linux-api-headers", "iana-etc", "tzdata",
+    "glibc", "sh", "bash", "coreutils", "util-linux", "systemd",
+    "gcc-libs", "libgcc", "glibc-locales", "shadow", "pam",
+    "linux", "linux-firmware", "grub", "efibootmgr",
+];
 
 
 // Paths
@@ -30,30 +41,22 @@ fn home() -> Result<PathBuf, String> {
 }
 
 fn install_prefix() -> Result<PathBuf, String> {
-    if is_root() {
-        Ok(PathBuf::from("/usr/local"))
-    } else {
-        Ok(home()?.join(".local"))
-    }
+    if is_root() { Ok(PathBuf::from("/usr/local")) }
+    else         { Ok(home()?.join(".local")) }
 }
 
 fn db_dir() -> Result<PathBuf, String> {
-    if is_root() {
-        Ok(PathBuf::from("/var/lib/chiral"))
-    } else {
-        Ok(home()?.join(".local").join("share").join("chiral"))
-    }
+    if is_root() { Ok(PathBuf::from("/var/lib/chiral")) }
+    else         { Ok(home()?.join(".local").join("share").join("chiral")) }
 }
 
 fn db_file() -> Result<PathBuf, String> {
     Ok(db_dir()?.join("installed.db"))
 }
 
-
 // File tracking DB
-// Format:
-//   [pkgname=1.2.3|debian]
-//   /usr/local/bin/foo
+// Format:  [pkgname=1.2.3|debian]
+//          /usr/local/bin/foo
 
 
 fn db_ensure() -> Result<(), String> {
@@ -80,12 +83,12 @@ pub fn db_list() -> Result<Vec<(String, String, String)>, String> {
         let line = line.trim();
         if line.starts_with('[') && line.ends_with(']') {
             let inner = &line[1..line.len()-1];
-            let mut eq = inner.splitn(2, '=');
-            let name = eq.next().unwrap_or("").to_string();
-            let rest = eq.next().unwrap_or("unknown|unknown");
+            let mut eq   = inner.splitn(2, '=');
+            let name     = eq.next().unwrap_or("").to_string();
+            let rest     = eq.next().unwrap_or("unknown|unknown");
             let mut pipe = rest.splitn(2, '|');
-            let version = pipe.next().unwrap_or("unknown").to_string();
-            let source  = pipe.next().unwrap_or("unknown").to_string();
+            let version  = pipe.next().unwrap_or("unknown").to_string();
+            let source   = pipe.next().unwrap_or("unknown").to_string();
             out.push((name, version, source));
         }
     }
@@ -93,6 +96,7 @@ pub fn db_list() -> Result<Vec<(String, String, String)>, String> {
 }
 
 fn db_files_for(package: &str) -> Result<Vec<PathBuf>, String> {
+    let package = sanitize_db_field(package);
     let raw = db_read_all()?;
     let mut in_block = false;
     let mut files    = Vec::new();
@@ -111,64 +115,97 @@ fn db_files_for(package: &str) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
+/// All files tracked by every *other* installed package. Used before
+/// deleting a package's files, so we never remove a path another package
+/// still depends on (e.g. a shared file two packages both happened to ship).
+fn db_files_owned_by_others(package: &str) -> Result<HashSet<PathBuf>, String> {
+    let mut owned = HashSet::new();
+    for (name, _, _) in db_list()? {
+        if name == package { continue; }
+        for f in db_files_for(&name)? {
+            owned.insert(f);
+        }
+    }
+    Ok(owned)
+}
+
 fn db_is_installed(package: &str) -> bool {
-    db_list().unwrap_or_default()
-        .iter()
-        .any(|(n, _, _)| n == package)
+    let package = sanitize_db_field(package);
+    db_list().unwrap_or_default().iter().any(|(n, _, _)| n == &package)
 }
 
 fn db_get_entry(package: &str) -> Option<(String, String)> {
+    let package = sanitize_db_field(package);
     db_list().unwrap_or_default()
         .into_iter()
-        .find(|(n, _, _)| n == package)
+        .find(|(n, _, _)| n == &package)
         .map(|(_, v, s)| (v, s))
 }
 
+/// Strip characters that would corrupt the DB's own `[name=version|source]`
+/// delimiter format. Applied to any value (package name, version, source)
+/// before it's written, regardless of whether that value originated from
+/// user input or from a package's own untrusted metadata (Depends fields,
+/// Arch API JSON, etc).
+fn sanitize_db_field(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '[' | ']' | '=' | '|' | '\n' | '\r' => '_',
+            other => other,
+        })
+        .collect()
+}
+
+/// Write the DB file atomically: write to a temp file in the same directory,
+/// then rename it into place. A rename on the same filesystem is atomic, so
+/// a crash or kill mid-write can never leave installed.db truncated or
+/// half-written — readers only ever see the old file or the new one.
+fn db_write_atomic(content: &str) -> Result<(), String> {
+    let dir  = db_dir()?;
+    let file = db_file()?;
+    let tmp  = dir.join(format!("installed.db.tmp.{}", std::process::id()));
+
+    fs::write(&tmp, content).map_err(|e| format!("Cannot write DB temp file: {}", e))?;
+    fs::rename(&tmp, &file).map_err(|e| format!("Cannot commit DB update: {}", e))
+}
+
 fn db_add(package: &str, version: &str, source: &str, files: &[PathBuf]) -> Result<(), String> {
+    let package = sanitize_db_field(package);
+    let version = sanitize_db_field(version);
+    let source  = sanitize_db_field(source);
+
     let raw = db_read_all()?;
     let mut new_content = String::new();
     let mut skip = false;
 
     for line in raw.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with(&format!("[{}=", package)) {
-            skip = true;
-            continue;
-        }
+        if trimmed.starts_with(&format!("[{}=", package)) { skip = true; continue; }
         if skip && trimmed.starts_with('[') { skip = false; }
-        if !skip {
-            new_content.push_str(line);
-            new_content.push('\n');
-        }
+        if !skip { new_content.push_str(line); new_content.push('\n'); }
     }
 
     new_content.push_str(&format!("[{}={}|{}]\n", package, version, source));
-    for f in files {
-        new_content.push_str(&format!("{}\n", f.display()));
-    }
+    for f in files { new_content.push_str(&format!("{}\n", f.display())); }
     new_content.push('\n');
-    fs::write(db_file()?, new_content).map_err(|e| e.to_string())
+    db_write_atomic(&new_content)
 }
 
 fn db_remove_entry(package: &str) -> Result<(), String> {
+    let package = sanitize_db_field(package);
     let raw = db_read_all()?;
     let mut new_content = String::new();
     let mut skip = false;
 
     for line in raw.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with(&format!("[{}=", package)) {
-            skip = true;
-            continue;
-        }
+        if trimmed.starts_with(&format!("[{}=", package)) { skip = true; continue; }
         if skip && trimmed.starts_with('[') { skip = false; }
-        if !skip {
-            new_content.push_str(line);
-            new_content.push('\n');
-        }
+        if !skip { new_content.push_str(line); new_content.push('\n'); }
     }
-    fs::write(db_file()?, new_content).map_err(|e| e.to_string())
+    db_write_atomic(&new_content)
 }
+
 
 // Download
 
@@ -192,22 +229,204 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
 }
 
 
-// Arch API — returns full package info including deps
+// Checksum verification
+//
+// Every network path that lands a file on disk (packages *and* the
+// self-update binary) used to be trusted unconditionally. The upstreams
+// don't all offer the same integrity guarantees, so verification is
+// per-source rather than one generic "hash matches" helper bolted on top:
+//
+//   - Self-update (GitHub Releases): GitHub itself computes a SHA-256
+//     `digest` for every uploaded asset at upload time — not something the
+//     release author can edit after the fact. We verify against that, and
+//     refuse to self-replace if it's missing, unless explicitly overridden.
+//   - Our own CHPM package repo: we control it, so a package can ship a
+//     `<name>.tar.gz.sha256` sidecar next to the tarball. Verified if
+//     present. Absent just means the package predates this feature — that
+//     gets a loud warning, not a silent pass.
+//   - Arch fallback: the repo's own sync database (`<repo>.db` — the same
+//     file `pacman` itself trusts) carries a SHA256SUM per package/version.
+//   - Debian fallback: the repo's own `Packages` index (the same file `apt`
+//     itself trusts) carries a SHA256 per pool path.
+//
+// None of this is signature verification — it doesn't prove the upstream
+// index/API itself is honest, only that the bytes we saved match what that
+// index says they should be. That closes "a mirror handed me a corrupted or
+// substituted file" and "a MITM tampered with the download in transit", not
+// "the upstream's own index was compromised". Worth being explicit about
+// that boundary rather than implying more than this actually buys us.
+
+
+fn sha256_hex_of_file(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+
+    let mut f = File::open(path)
+        .map_err(|e| format!("Cannot open {:?} for hashing: {}", path, e))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = f.read(&mut buf)
+            .map_err(|e| format!("Read error while hashing {:?}: {}", path, e))?;
+        if n == 0 { break; }
+        hasher.update(&buf[..n]);
+    }
+
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        hex.push_str(&format!("{:02x}", b));
+    }
+    Ok(hex)
+}
+
+/// Case- and whitespace-insensitive comparison — upstreams are inconsistent
+/// about hex casing, and sidecar files often have trailing newlines.
+fn checksum_matches(actual_hex: &str, expected_hex: &str) -> bool {
+    actual_hex.trim().eq_ignore_ascii_case(expected_hex.trim())
+}
+
+/// Hash `path` and compare against `expected_hex`. On mismatch the file is
+/// deleted immediately — a corrupted or substituted download must never
+/// survive to be extracted, installed, or (for self-update) executed just
+/// because a later step forgot to check the return value.
+fn verify_file_sha256(path: &Path, expected_hex: &str, what: &str) -> Result<(), String> {
+    let actual = sha256_hex_of_file(path)?;
+    if !checksum_matches(&actual, expected_hex) {
+        let _ = fs::remove_file(path);
+        return Err(format!(
+            "Checksum mismatch for {}: expected {}, got {}. File deleted, refusing to use it.",
+            what, expected_hex.trim(), actual
+        ));
+    }
+    Ok(())
+}
+
+/// Best-effort check against our own CHPM package repo's optional
+/// `<name>.tar.gz.sha256` sidecar. Returns Ok(()) both when the sidecar is
+/// missing/malformed (nothing to check against yet — warn and proceed) and
+/// when it matches. Only returns Err on an actual mismatch, since that's a
+/// real anomaly (stale mirror, corrupted upload, tampering) worth aborting
+/// the whole install for, rather than silently falling back to another
+/// source and hiding it.
+fn verify_chpm_package_checksum(package: &str, tarball: &Path) -> Result<(), String> {
+    let sidecar_url = format!("{}/{}.tar.gz.sha256", SERVER, package);
+
+    let resp = match reqwest::blocking::get(&sidecar_url) {
+        Ok(r) if r.status().is_success() => r,
+        _ => {
+            eprintln!("  ⚠ No published checksum for '{}' yet — installing unverified.", package);
+            return Ok(());
+        }
+    };
+
+    let body = match resp.text() {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("  ⚠ Could not read checksum file for '{}' — installing unverified.", package);
+            return Ok(());
+        }
+    };
+
+    // Accept a bare hex digest or `sha256sum`-style "<hex>  <filename>".
+    let expected = body.split_whitespace().next().unwrap_or("");
+    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        eprintln!("  ⚠ Checksum file for '{}' is malformed — installing unverified.", package);
+        return Ok(());
+    }
+
+    verify_file_sha256(tarball, expected, &format!("package '{}'", package))
+}
+
+/// Fetch and parse the Arch sync database for `pkg`'s repo, returning the
+/// SHA256SUM the repo itself published for this exact package/version.
+/// Assumes the sync db is gzip-compressed, which is the default for
+/// pacman-produced `.db` files; if a mirror ever changes that, this will
+/// need a zstd path added alongside it.
+fn arch_fetch_sha256(pkg: &ArchPkg) -> Result<String, String> {
+    let db_url = format!("{}/{}/os/x86_64/{}.db", ARCH_MIRROR, pkg.repo, pkg.repo);
+    let mut resp = reqwest::blocking::get(&db_url)
+        .map_err(|e| format!("Arch db fetch error: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("Arch db not reachable (HTTP {})", resp.status()));
+    }
+
+    let mut bytes = Vec::new();
+    resp.copy_to(&mut bytes).map_err(|e| e.to_string())?;
+
+    let entry_name = format!("{}-{}/desc", pkg.pkgname, pkg.version);
+    let mut archive = Archive::new(GzDecoder::new(&bytes[..]));
+
+    for entry in archive.entries().map_err(|e| e.to_string())? {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path().map_err(|e| e.to_string())?
+            .to_string_lossy().trim_end_matches('/').to_string();
+        if path != entry_name { continue; }
+
+        let mut content = String::new();
+        entry.read_to_string(&mut content).map_err(|e| e.to_string())?;
+
+        let mut lines = content.lines();
+        while let Some(line) = lines.next() {
+            if line.trim() == "%SHA256SUM%" {
+                if let Some(hash) = lines.next() {
+                    return Ok(hash.trim().to_string());
+                }
+            }
+        }
+        return Err(format!("No %SHA256SUM% field for {} in {} db", pkg.pkgname, pkg.repo));
+    }
+
+    Err(format!("'{}' not found in {} sync db (version mismatch?)", pkg.pkgname, pkg.repo))
+}
+
+/// Fetch Debian's package index and return the SHA256 published for the
+/// given pool path (e.g. "pool/main/g/glibc/libc6_...deb"). This is the
+/// same index `apt` itself trusts — normally backed by the Release file's
+/// signature, which this does not check, so it closes "did I get the file
+/// the index says I should have" but not "is this repo compromised".
+fn debian_fetch_sha256(pool_path: &str) -> Result<String, String> {
+    let idx_url = "https://deb.debian.org/debian/dists/stable/main/binary-amd64/Packages.gz";
+    let mut resp = reqwest::blocking::get(idx_url)
+        .map_err(|e| format!("Debian index fetch error: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("Debian index not reachable (HTTP {})", resp.status()));
+    }
+
+    let mut bytes = Vec::new();
+    resp.copy_to(&mut bytes).map_err(|e| e.to_string())?;
+
+    let mut text = String::new();
+    GzDecoder::new(&bytes[..]).read_to_string(&mut text)
+        .map_err(|e| format!("Cannot decompress Packages.gz: {}", e))?;
+
+    for stanza in text.split("\n\n") {
+        let is_match = stanza.lines().any(|l| {
+            l.strip_prefix("Filename: ").map(|f| f.trim() == pool_path).unwrap_or(false)
+        });
+        if is_match {
+            return stanza.lines()
+                .find_map(|l| l.strip_prefix("SHA256: "))
+                .map(|s| s.trim().to_string())
+                .ok_or_else(|| "Package stanza has no SHA256 field".to_string());
+        }
+    }
+    Err(format!("'{}' not found in Debian package index", pool_path))
+}
+
+
+// Arch API
 
 
 struct ArchPkg {
-    repo:     String,
-    pkgname:  String,
-    version:  String,   // pkgver-pkgrel
-    arch:     String,
-    depends:  Vec<String>,
+    repo:    String,
+    pkgname: String,
+    version: String,
+    arch:    String,
+    depends: Vec<String>,
 }
 
 fn arch_query(package: &str) -> Result<ArchPkg, String> {
-    let api = format!(
-        "https://archlinux.org/packages/search/json/?name={}",
-        package
-    );
+    let api = format!("https://archlinux.org/packages/search/json/?name={}", package);
 
     let client = reqwest::blocking::Client::new();
     let resp = client
@@ -221,70 +440,49 @@ fn arch_query(package: &str) -> Result<ArchPkg, String> {
     let json: serde_json::Value = serde_json::from_str(&resp)
         .map_err(|e| format!("Arch API parse error: {}", e))?;
 
-    let results = json["results"]
-        .as_array()
-        .ok_or("No results from Arch API")?;
-
+    let results = json["results"].as_array().ok_or("No results from Arch API")?;
     if results.is_empty() {
         return Err(format!("'{}' not found in Arch repos", package));
     }
 
     let pkg = results.iter()
-        .find(|r| {
-            let repo = r["repo"].as_str().unwrap_or("");
-            repo == "core" || repo == "extra"
-        })
+        .find(|r| { let repo = r["repo"].as_str().unwrap_or(""); repo == "core" || repo == "extra" })
         .or_else(|| results.first())
         .ok_or("No suitable Arch package found")?;
 
-    let repo     = pkg["repo"].as_str().unwrap_or("extra").to_string();
-    let arch_str = pkg["arch"].as_str().unwrap_or("x86_64").to_string();
-    let pkgname  = pkg["pkgname"].as_str().unwrap_or(package).to_string();
-    let pkgver   = pkg["pkgver"].as_str().unwrap_or("").to_string();
-    let pkgrel   = pkg["pkgrel"].as_str().unwrap_or("1").to_string();
-    let version  = format!("{}-{}", pkgver, pkgrel);
+    let repo    = pkg["repo"].as_str().unwrap_or("extra").to_string();
+    let arch_str= pkg["arch"].as_str().unwrap_or("x86_64").to_string();
+    let pkgname = pkg["pkgname"].as_str().unwrap_or(package).to_string();
+    let pkgver  = pkg["pkgver"].as_str().unwrap_or("").to_string();
+    let pkgrel  = pkg["pkgrel"].as_str().unwrap_or("1").to_string();
+    let version = format!("{}-{}", pkgver, pkgrel);
 
-    // Parse depends array — entries can have version constraints like "glib2>=2.80"
-    // We strip the version constraint and just keep the name
     let depends: Vec<String> = pkg["depends"]
-        .as_array()
-        .unwrap_or(&vec![])
+        .as_array().unwrap_or(&vec![])
         .iter()
         .filter_map(|d| d.as_str())
-        .map(|d| {
-            // Strip >=, <=, =, >, < version constraints
-            d.split(|c| c == '>' || c == '<' || c == '=')
-             .next()
-             .unwrap_or(d)
-             .trim()
-             .to_string()
-        })
+        .map(|d| strip_ver(d))
+        .filter(|d| !d.is_empty())
         .collect();
 
     Ok(ArchPkg { repo, pkgname, version, arch: arch_str, depends })
 }
 
 fn arch_download_url(pkg: &ArchPkg) -> String {
-    let filename = format!(
-        "{}-{}-{}.pkg.tar.zst",
-        pkg.pkgname, pkg.version, pkg.arch
-    );
+    let filename = format!("{}-{}-{}.pkg.tar.zst", pkg.pkgname, pkg.version, pkg.arch);
     format!("{}/{}/os/x86_64/{}", ARCH_MIRROR, pkg.repo, filename)
 }
 
 fn extract_pkg_zst(pkg_path: &Path, dest: &Path) -> Result<(), String> {
-    let tmp_dir = pkg_path.parent().unwrap_or(Path::new("/tmp"))
-        .join("arch_extracted");
+    let tmp_dir = pkg_path.parent().unwrap_or(Path::new("/tmp")).join("arch_extracted");
     fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
 
     let status = std::process::Command::new("tar")
         .args([
             "xf", pkg_path.to_str().unwrap(),
             "-C", tmp_dir.to_str().unwrap(),
-            "--exclude=.PKGINFO",
-            "--exclude=.BUILDINFO",
-            "--exclude=.MTREE",
-            "--exclude=.INSTALL",
+            "--exclude=.PKGINFO", "--exclude=.BUILDINFO",
+            "--exclude=.MTREE",  "--exclude=.INSTALL",
         ])
         .status()
         .map_err(|e| format!("tar failed: {}", e))?;
@@ -307,7 +505,7 @@ fn extract_pkg_zst(pkg_path: &Path, dest: &Path) -> Result<(), String> {
 }
 
 fn try_arch(package: &str, dest: &Path) -> Result<(String, Vec<String>), String> {
-    let pkg = arch_query(package)?;
+    let pkg     = arch_query(package)?;
     let version = pkg.version.clone();
     let deps    = pkg.depends.clone();
     let url     = arch_download_url(&pkg);
@@ -316,24 +514,34 @@ fn try_arch(package: &str, dest: &Path) -> Result<(String, Vec<String>), String>
         .join(format!("chiral-{}.pkg.tar.zst", package));
 
     download(&url, &pkg_tmp)?;
+
+    match arch_fetch_sha256(&pkg) {
+        Ok(expected) => verify_file_sha256(&pkg_tmp, &expected, &format!("Arch package '{}'", package))?,
+        Err(e) => eprintln!(
+            "  ⚠ Could not verify Arch checksum for '{}' ({}) — installing unverified.", package, e
+        ),
+    }
+
     extract_pkg_zst(&pkg_tmp, dest)?;
     let _ = fs::remove_file(&pkg_tmp);
-
     Ok((version, deps))
 }
 
 // Debian fallback
 
 
-fn debian_find_deb(package: &str) -> Result<(String, String), String> {
-    let client = reqwest::blocking::Client::new();
-    let search_url = format!(
-        "https://packages.debian.org/stable/amd64/{}/download",
-        package
-    );
+/// Pull the pool-relative path out of a deb.debian.org download URL, e.g.
+/// "https://deb.debian.org/debian/pool/main/g/glibc/libc6_...deb" ->
+/// "pool/main/g/glibc/libc6_...deb" — this is exactly the `Filename:` field
+/// the Packages index uses, so it's the key for checksum lookup.
+fn debian_relative_path(url: &str) -> Option<String> {
+    url.find("pool/").map(|i| url[i..].to_string())
+}
 
+fn debian_find_deb(package: &str) -> Result<(String, String, String), String> {
+    let client = reqwest::blocking::Client::new();
     let page = client
-        .get(&search_url)
+        .get(&format!("https://packages.debian.org/stable/amd64/{}/download", package))
         .header("User-Agent", "chiral-package-manager")
         .send()
         .map_err(|e| format!("Debian search error: {}", e))?
@@ -350,17 +558,15 @@ fn debian_find_deb(package: &str) -> Result<(String, String), String> {
                         let filename = url.split('/').last().unwrap_or("");
                         let version = filename
                             .trim_end_matches("_amd64.deb")
-                            .splitn(2, '_')
-                            .nth(1)
-                            .unwrap_or("unknown")
-                            .to_string();
-                        return Ok((url.to_string(), version));
+                            .splitn(2, '_').nth(1)
+                            .unwrap_or("unknown").to_string();
+                        let pool_path = debian_relative_path(url).unwrap_or_default();
+                        return Ok((url.to_string(), version, pool_path));
                     }
                 }
             }
         }
     }
-
     Err(format!("Could not find '{}' in Debian stable", package))
 }
 
@@ -374,20 +580,13 @@ fn extract_deb(deb_path: &Path, dest: &Path) -> Result<(), String> {
         .status()
         .map_err(|e| format!("ar not found: {}", e))?;
 
-    if !status.success() {
-        return Err("Failed to extract .deb with ar".to_string());
-    }
+    if !status.success() { return Err("Failed to extract .deb with ar".to_string()); }
 
     let data_tar = fs::read_dir(&tmp_dir)
         .map_err(|e| e.to_string())?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("data.tar"))
-                .unwrap_or(false)
-        })
+        .filter_map(|e| e.ok()).map(|e| e.path())
+        .find(|p| p.file_name().and_then(|n| n.to_str())
+            .map(|n| n.starts_with("data.tar")).unwrap_or(false))
         .ok_or("No data.tar.* found inside .deb")?;
 
     let stage = tmp_dir.join("stage");
@@ -395,31 +594,37 @@ fn extract_deb(deb_path: &Path, dest: &Path) -> Result<(), String> {
 
     let status = std::process::Command::new("tar")
         .args(["xf", data_tar.to_str().unwrap(), "-C", stage.to_str().unwrap()])
-        .status()
-        .map_err(|e| format!("tar failed: {}", e))?;
+        .status().map_err(|e| format!("tar failed: {}", e))?;
 
-    if !status.success() {
-        return Err("Failed to extract data.tar from .deb".to_string());
-    }
+    if !status.success() { return Err("Failed to extract data.tar from .deb".to_string()); }
 
     let status = std::process::Command::new("tar")
         .args(["czf", dest.to_str().unwrap(), "-C", stage.to_str().unwrap(), "."])
-        .status()
-        .map_err(|e| format!("tar repack failed: {}", e))?;
+        .status().map_err(|e| format!("tar repack failed: {}", e))?;
 
-    if !status.success() {
-        return Err("Failed to repack .deb data as .tar.gz".to_string());
-    }
+    if !status.success() { return Err("Failed to repack .deb data as .tar.gz".to_string()); }
 
     let _ = fs::remove_dir_all(&tmp_dir);
     Ok(())
 }
 
 fn try_debian(package: &str, dest: &Path) -> Result<String, String> {
-    let (deb_url, version) = debian_find_deb(package)?;
+    let (deb_url, version, pool_path) = debian_find_deb(package)?;
     let deb_tmp = dest.parent().unwrap_or(Path::new("/tmp"))
         .join(format!("chiral-{}.deb", package));
     download(&deb_url, &deb_tmp)?;
+
+    if pool_path.is_empty() {
+        eprintln!("  ⚠ Could not determine pool path for '{}' — installing unverified.", package);
+    } else {
+        match debian_fetch_sha256(&pool_path) {
+            Ok(expected) => verify_file_sha256(&deb_tmp, &expected, &format!("Debian package '{}'", package))?,
+            Err(e) => eprintln!(
+                "  ⚠ Could not verify Debian checksum for '{}' ({}) — installing unverified.", package, e
+            ),
+        }
+    }
+
     extract_deb(&deb_tmp, dest)?;
     let _ = fs::remove_file(&deb_tmp);
     Ok(version)
@@ -427,55 +632,38 @@ fn try_debian(package: &str, dest: &Path) -> Result<String, String> {
 
 
 // Dependency resolution
-//
-// Uses Arch API for dep lists (most complete and structured).
-// Builds a full install order via BFS then topological sort so deepest
-// deps install first.
-//
-// Returns Vec<String> in install order, NOT including packages already
-// installed, NOT including the root package itself (caller installs that).
 
-/// Strip version constraints from a dep string e.g. "glib2>=2.80" → "glib2"
+
 fn strip_ver(dep: &str) -> String {
     dep.split(|c| c == '>' || c == '<' || c == '=' || c == ':')
-        .next()
-        .unwrap_or(dep)
-        .trim()
-        .to_string()
+        .next().unwrap_or(dep).trim().to_string()
 }
 
-/// Detect which package manager the host OS uses
+
+// Host OS detection
+
+
 enum HostPm { Pacman, Apt, Rpm, Unknown }
 
 fn detect_host_pm() -> HostPm {
-    if std::process::Command::new("pacman").arg("--version")
+    let check = |cmd: &str| std::process::Command::new(cmd)
+        .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status().map(|s| s.success()).unwrap_or(false) {
-        return HostPm::Pacman;
-    }
-    if std::process::Command::new("dpkg").arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status().map(|s| s.success()).unwrap_or(false) {
-        return HostPm::Apt;
-    }
-    if std::process::Command::new("rpm").arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status().map(|s| s.success()).unwrap_or(false) {
-        return HostPm::Rpm;
-    }
+        .status().map(|s| s.success()).unwrap_or(false);
+
+    if check("pacman") { return HostPm::Pacman; }
+    if check("dpkg")   { return HostPm::Apt; }
+    if check("rpm")    { return HostPm::Rpm; }
     HostPm::Unknown
 }
 
-/// Check if a dep is already satisfied by the host OS.
-/// Checks 4 ways in order:
-///   1. chiral's own DB (we installed it)
-///   2. host package manager (pacman -Q / dpkg -s / rpm -q)
-///   3. binary exists on PATH (for things like "sh", "bash")
-///   4. shared lib visible to ldconfig (for "libfoo.so" style dep names)
+/// Smart system check — 6 layers deep.
+/// Returns true if the dep is already satisfied by ANY means on this system.
 fn system_has(dep: &str, host_pm: &HostPm) -> bool {
+    // 0. Never-install list — always pretend these are present
+    if NEVER_INSTALL.contains(&dep) { return true; }
+
     // 1. Chiral DB
     if db_is_installed(dep) { return true; }
 
@@ -483,133 +671,90 @@ fn system_has(dep: &str, host_pm: &HostPm) -> bool {
     let pm_found = match host_pm {
         HostPm::Pacman => std::process::Command::new("pacman")
             .args(["-Q", dep])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false),
-
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false),
         HostPm::Apt => std::process::Command::new("dpkg")
             .args(["-s", dep])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false),
-
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false),
         HostPm::Rpm => std::process::Command::new("rpm")
             .args(["-q", dep])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false),
-
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false),
         HostPm::Unknown => false,
     };
     if pm_found { return true; }
 
-    // 3. Binary on PATH (handles "sh", "bash", "python", etc.)
-    let bin_found = std::process::Command::new("sh")
-        .args(["-c", &format!("command -v {}", dep)])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    // 3. Binary on PATH — invoke `which` directly (no shell), so a dependency
+    // name containing shell metacharacters can never be interpreted as a command.
+    let bin_found = std::process::Command::new("which")
+        .arg(dep)
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .status().map(|s| s.success()).unwrap_or(false);
     if bin_found { return true; }
 
-    // 4. Shared lib visible to ldconfig (handles "libfoo.so", "libz.so" etc.)
+    // 4. Shared lib via ldconfig + direct paths
     if dep.contains(".so") {
         let ldconfig_found = std::process::Command::new("sh")
             .args(["-c", &format!("ldconfig -p 2>/dev/null | grep -q '{}'", dep)])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .status().map(|s| s.success()).unwrap_or(false);
         if ldconfig_found { return true; }
 
-        // Direct lib path check
-        let lib_paths = [
-            format!("/usr/lib/{}", dep),
-            format!("/lib/{}", dep),
-            format!("/usr/local/lib/{}", dep),
-            format!("/usr/lib/x86_64-linux-gnu/{}", dep),
-        ];
-        if lib_paths.iter().any(|p| Path::new(p).exists()) {
-            return true;
+        for prefix in &["/usr/lib", "/lib", "/usr/local/lib", "/usr/lib/x86_64-linux-gnu"] {
+            if Path::new(&format!("{}/{}", prefix, dep)).exists() { return true; }
         }
     }
 
-    // 5. pkg-config — covers manually compiled libraries that ran `make install`
-    // e.g. alsa-lib installs alsa.pc, so `pkg-config --exists alsa` works
+    // 5. pkg-config — catches manually compiled libs
     let pc_found = std::process::Command::new("pkg-config")
         .args(["--exists", dep])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .status().map(|s| s.success()).unwrap_or(false);
     if pc_found { return true; }
 
-    // Also try common pkg-config name variants:
-    // dep "alsa-lib" → try "alsa", dep "libpng" → try "libpng16" etc.
-    let variants = [
-        dep.trim_start_matches("lib").to_string(),          // libfoo → foo
-        dep.replace('-', "_"),                               // alsa-lib → alsa_lib
-        dep.replace("lib", "").replace('-', ""),             // libfoo-bar → foobar
-    ];
-    for variant in &variants {
+    // pkg-config name variants
+    for variant in &[
+        dep.trim_start_matches("lib").to_string(),
+        dep.replace('-', "_"),
+        dep.replace("lib", "").replace('-', ""),
+    ] {
         let found = std::process::Command::new("pkg-config")
             .args(["--exists", variant])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false);
         if found { return true; }
     }
 
-    // 6. Direct filesystem checks for manually installed packages
-    // Checks /usr, /usr/local, /opt for binaries, libs, headers
+    // 6. Direct filesystem scan — catches manual installs from source
     let search_name = dep.trim_start_matches("lib");
-    let fs_checks = [
-        // Binary
+    for path in &[
         format!("/usr/bin/{}", dep),
         format!("/usr/local/bin/{}", dep),
         format!("/usr/sbin/{}", dep),
-        // Library (with common suffixes)
         format!("/usr/lib/lib{}.so", dep),
         format!("/usr/local/lib/lib{}.so", dep),
         format!("/usr/lib/lib{}.a", dep),
-        // Header (covers manually compiled dev packages)
         format!("/usr/include/{}", dep),
         format!("/usr/include/{}", search_name),
         format!("/usr/local/include/{}", dep),
-        // pkg-config file directly
         format!("/usr/lib/pkgconfig/{}.pc", dep),
         format!("/usr/share/pkgconfig/{}.pc", dep),
         format!("/usr/local/lib/pkgconfig/{}.pc", dep),
-    ];
-    if fs_checks.iter().any(|p| Path::new(p).exists()) {
-        return true;
+    ] {
+        if Path::new(path).exists() { return true; }
     }
 
     false
 }
 
-/// Resolve full dependency tree for a package.
-/// Returns packages in install order (deps first, requested package last).
-/// Skips anything already satisfied by chiral DB or host OS.
-/// Detects circular deps and breaks the cycle rather than looping forever.
+/// Resolve full dep tree — BFS + Kahn's topological sort.
+/// Skips NEVER_INSTALL, already-installed, and system-present packages.
 pub fn resolve_deps(package: &str) -> Result<Vec<String>, String> {
     let host_pm = detect_host_pm();
 
-    // dep_map: pkgname → its direct deps (from Arch API)
     let mut dep_map: HashMap<String, Vec<String>> = HashMap::new();
-    // visited: packages we've already fetched deps for
     let mut visited: HashSet<String> = HashSet::new();
-    // queue for BFS
-    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut queue:   VecDeque<String> = VecDeque::new();
 
     queue.push_back(package.to_string());
 
@@ -617,13 +762,12 @@ pub fn resolve_deps(package: &str) -> Result<Vec<String>, String> {
         if visited.contains(&pkg) { continue; }
         visited.insert(pkg.clone());
 
-        // Skip if already satisfied by system or chiral
-        if system_has(&pkg, &host_pm) {
+        // Skip if in never-install list or already on system
+        if NEVER_INSTALL.contains(&pkg.as_str()) || system_has(&pkg, &host_pm) {
             dep_map.entry(pkg).or_default();
             continue;
         }
 
-        // Query Arch for deps — if Arch doesn't know it, treat as no deps
         let deps = match arch_query(&pkg) {
             Ok(info) => info.depends,
             Err(_)   => vec![],
@@ -631,34 +775,19 @@ pub fn resolve_deps(package: &str) -> Result<Vec<String>, String> {
 
         let clean_deps: Vec<String> = deps.iter()
             .map(|d| strip_ver(d))
-            .filter(|d| !d.is_empty())
+            .filter(|d| !d.is_empty() && !NEVER_INSTALL.contains(&d.as_str()))
             .collect();
 
         for dep in &clean_deps {
-            if !visited.contains(dep) {
-                queue.push_back(dep.clone());
-            }
+            if !visited.contains(dep) { queue.push_back(dep.clone()); }
         }
 
         dep_map.insert(pkg, clean_deps);
     }
 
-    // Topological sort (Kahn's algorithm) so deps install before dependents
-    let mut in_degree: HashMap<String, usize> = HashMap::new();
-    for (pkg, deps) in &dep_map {
-        in_degree.entry(pkg.clone()).or_insert(0);
-        for dep in deps {
-            if dep_map.contains_key(dep) {
-                *in_degree.entry(dep.clone()).or_insert(0) += 0; // ensure key exists
-                // pkg depends on dep → dep must come first
-                // in_degree tracks how many things each node depends on
-            }
-        }
-    }
-
-    // Build reverse: for each pkg, which pkgs depend on it
+    // Kahn's topological sort
     let mut reverse: HashMap<String, Vec<String>> = HashMap::new();
-    let mut indeg: HashMap<String, usize> = HashMap::new();
+    let mut indeg:   HashMap<String, usize>        = HashMap::new();
 
     for (pkg, deps) in &dep_map {
         indeg.entry(pkg.clone()).or_insert(0);
@@ -670,14 +799,10 @@ pub fn resolve_deps(package: &str) -> Result<Vec<String>, String> {
         }
     }
 
-    // Start with nodes that have no deps (in-degree 0)
     let mut ready: VecDeque<String> = indeg.iter()
-        .filter(|(_, &d)| d == 0)
-        .map(|(n, _)| n.clone())
-        .collect();
+        .filter(|(_, &d)| d == 0).map(|(n, _)| n.clone()).collect();
 
     let mut order: Vec<String> = Vec::new();
-
     while let Some(pkg) = ready.pop_front() {
         order.push(pkg.clone());
         if let Some(dependents) = reverse.get(&pkg) {
@@ -689,19 +814,22 @@ pub fn resolve_deps(package: &str) -> Result<Vec<String>, String> {
         }
     }
 
-    // Filter out: satisfied by system/chiral, and the root package itself
+    // Final filter — remove root package, already-satisfied, and never-install
     let host_pm2 = detect_host_pm();
     let result: Vec<String> = order.into_iter()
-        .filter(|p| p != package && !system_has(p, &host_pm2))
+        .filter(|p| {
+            p != package
+            && !NEVER_INSTALL.contains(&p.as_str())
+            && !system_has(p, &host_pm2)
+        })
         .collect();
 
     Ok(result)
 }
 
-
-// Download with fallback chain — returns (source, version, deps)
-// deps only populated when Arch is used (that's where we get them)
-
+// ─────────────────────────────────────────────────────────────────────────────
+// Download with 3-way fallback — returns (source, version)
+// ─────────────────────────────────────────────────────────────────────────────
 
 fn download_package(
     ui: &mut ChiralUI,
@@ -712,6 +840,9 @@ fn download_package(
     let url = format!("{}/{}.tar.gz", SERVER, package);
     ui.render_progress_frame(20, 100, &[format!("Trying GitHub packages/{}.tar.gz", package)], false);
     if download(&url, dest).is_ok() {
+        // Hard-fails (via `?`) only on an actual mismatch. A missing or
+        // malformed sidecar is a soft warning inside the function itself.
+        verify_chpm_package_checksum(package, dest)?;
         return Ok(("github".to_string(), "latest".to_string()));
     }
 
@@ -723,7 +854,7 @@ fn download_package(
 
     // Try 3: Arch
     ui.render_progress_frame(50, 100, &["Trying Arch Linux repos...".to_string()], false);
-    if let Ok((version, _deps)) = try_arch(package, dest) {
+    if let Ok((version, _)) = try_arch(package, dest) {
         return Ok(("arch".to_string(), version));
     }
 
@@ -734,25 +865,147 @@ fn download_package(
 }
 
 
-// Install a single package (no dep resolution — used internally)
+// Extract — smart symlink and file handling, never breaks existing dirs
 
 
-fn install_one(ui: &mut ChiralUI, package: &str, prefix: &Path) -> Result<(), String> {
-    let tmp = std::env::temp_dir().join(format!("chiral-{}.tar.gz", package));
-    let (source, version) = download_package(ui, package, &tmp)?;
 
-    ui.render_progress_frame(65, 100, &[format!("Extracting {} {}", package, version)], false);
-    let placed = extract(&tmp, prefix)?;
-    let _ = fs::remove_file(&tmp);
+// Path routing (cross-distro layout normalization)
 
-    db_add(package, &version, &source, &placed)?;
-    ui.render_progress_frame(100, 100, &[format!("✓ {} {} [{}]", package, version, source)], false);
-    Ok(())
+
+/// True if `s` looks like a Debian/Ubuntu multiarch triplet directory name
+/// (e.g. "x86_64-linux-gnu", "aarch64-linux-gnu", "arm-linux-gnueabihf").
+fn is_multiarch_triplet(s: &str) -> bool {
+    s.ends_with("-linux-gnu") || s.ends_with("-linux-gnueabihf") || s.ends_with("-linux-musl")
 }
 
+/// Map a package's internal path to where it should land under our prefix.
+///
+/// Returns `None` for entries that should never be installed (distro packaging
+/// metadata that isn't part of the actual payload).
+///
+/// Unlike a "route by file type, keep only the basename" approach, this keeps
+/// every directory's internal structure intact (pkgconfig/, cmake/, python
+/// site-packages, systemd units, etc.) — the only thing it collapses is the
+/// Debian multiarch triplet component, which is the one thing that actually
+/// needs collapsing for the dynamic linker to find things without extra config.
+fn normalize_rel_path(safe: &Path) -> Option<PathBuf> {
+    let s = safe.to_string_lossy();
 
-// Extract
+    // Distro/package-manager metadata — never part of the installed payload.
+    if s == ".PKGINFO" || s == ".MTREE" || s == ".BUILDINFO" || s == ".INSTALL"
+        || s == ".changelog" || s.starts_with("DEBIAN/") {
+        return None;
+    }
 
+    let mut comps: Vec<String> = safe.components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+
+    if comps.is_empty() { return None; }
+
+    // Strip a single leading "usr" or "." component so Arch's /usr-everything
+    // layout and Debian's split layout both land in the same place.
+    if let Some(first) = comps.first() {
+        if first == "usr" || first == "." {
+            comps.remove(0);
+        }
+    }
+
+    if comps.is_empty() { return None; }
+
+    // Collapse "lib/<multiarch-triplet>/rest..." -> "lib/rest...", and
+    // normalize lib32/lib64 -> lib, WITHOUT discarding the remainder of the
+    // path. This is what actually fixes multiarch fragmentation: the linker
+    // only needs to look in one place, and nothing else about the package's
+    // internal layout gets disturbed.
+    if comps.len() >= 2 {
+        let is_libdir = comps[0] == "lib" || comps[0] == "lib32" || comps[0] == "lib64";
+        if is_libdir && is_multiarch_triplet(&comps[1]) {
+            comps.remove(1);
+            comps[0] = "lib".to_string();
+        } else if comps[0] == "lib32" || comps[0] == "lib64" {
+            comps[0] = "lib".to_string();
+        }
+    }
+
+    if comps.is_empty() { return None; }
+    Some(comps.iter().collect())
+}
+
+/// Check for the ELF magic bytes so we never hand a non-ELF file to patchelf
+/// just because its name happened to contain ".so".
+fn is_elf_file(path: &Path) -> bool {
+    let Ok(mut f) = File::open(path) else { return false };
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).is_ok() && magic == *b"\x7fELF"
+}
+
+/// Fix a binary/library's RPATH so it can find libraries under our prefix,
+/// without discarding whatever RPATH it already had (some binaries genuinely
+/// need multiple search paths). Best-effort: if patchelf isn't installed or
+/// the file isn't ELF, this is a silent no-op rather than a hard failure.
+fn fix_rpath(dest: &Path, lib_dir: &Path) {
+    if !is_elf_file(dest) { return; }
+
+    let lib_dir_str = lib_dir.to_string_lossy().to_string();
+
+    let existing = std::process::Command::new("patchelf")
+        .args(["--print-rpath", &dest.to_string_lossy()])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    let already_present = existing
+        .split(':')
+        .any(|p| p == lib_dir_str);
+    if already_present { return; }
+
+    let new_rpath = if existing.is_empty() {
+        lib_dir_str
+    } else {
+        format!("{}:{}", existing, lib_dir_str)
+    };
+
+    let _ = std::process::Command::new("patchelf")
+        .args(["--set-rpath", &new_rpath, &dest.to_string_lossy()])
+        .status();
+}
+
+/// Resolve "." and ".." components without touching the filesystem (the
+/// target of a symlink we're about to create usually doesn't exist yet, so
+/// we can't use fs::canonicalize on it).
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::ParentDir => { out.pop(); }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// True if a symlink at `dest` pointing to `link_target` would resolve to
+/// somewhere outside `prefix`. Catches both absolute-path escapes
+/// (`-> /etc/passwd`) and relative escapes (`-> ../../../../etc/passwd`).
+fn symlink_escapes_prefix(dest: &Path, link_target: &Path, prefix: &Path) -> bool {
+    let target_abs = if link_target.is_absolute() {
+        link_target.to_path_buf()
+    } else {
+        match dest.parent() {
+            Some(parent) => parent.join(link_target),
+            None => return true, // no parent — treat as suspicious
+        }
+    };
+
+    let normalized_target = normalize_lexically(&target_abs);
+    let normalized_prefix = normalize_lexically(prefix);
+
+    !normalized_target.starts_with(&normalized_prefix)
+}
 
 fn extract(tarball: &Path, prefix: &Path) -> Result<Vec<PathBuf>, String> {
     let mut archive = Archive::new(GzDecoder::new(
@@ -768,88 +1021,151 @@ fn extract(tarball: &Path, prefix: &Path) -> Result<Vec<PathBuf>, String> {
         let mut entry = entry.map_err(|e| format!("Bad tar entry: {}", e))?;
         let raw = entry.path().map_err(|e| e.to_string())?;
 
+        // Path traversal guard
         let safe: PathBuf = raw.components()
             .filter(|c| matches!(c, std::path::Component::Normal(_)))
             .collect();
 
         if safe.as_os_str().is_empty() { continue; }
 
-        let rel: PathBuf = {
-            let mut comps = safe.components();
-            let first = comps.next()
-                .map(|c| c.as_os_str().to_string_lossy().to_string())
-                .unwrap_or_default();
-            if first == "usr" || first == "." {
-                comps.collect()
-            } else {
-                safe.clone()
-            }
+        // Route the package's internal path to our normalized layout.
+        // Skips distro packaging metadata and collapses multiarch lib dirs
+        // while preserving the rest of the internal directory structure.
+        let rel: PathBuf = match normalize_rel_path(&safe) {
+            Some(r) => r,
+            None => continue,
         };
 
         if rel.as_os_str().is_empty() { continue; }
 
-        let dest = prefix.join(&rel);
+        let dest       = prefix.join(&rel);
         let entry_type = entry.header().entry_type();
 
+        // directories
         if entry_type.is_dir() {
-            fs::create_dir_all(&dest)
-                .map_err(|e| format!("Cannot create dir {:?}: {}", dest, e))?;
+            // Always use create_dir_all — never fails if dir already exists
+            let _ = fs::create_dir_all(&dest);
             continue;
         }
 
+        // Ensure parent exists
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Cannot create dir {:?}: {}", parent, e))?;
+            let _ = fs::create_dir_all(parent);
         }
 
+        // syslinks
         if entry_type.is_symlink() {
             let link_target = entry.link_name()
                 .map_err(|e| e.to_string())?
                 .ok_or("Symlink has no target")?;
             let link_target = PathBuf::from(link_target.as_ref());
 
-            if dest.exists() || dest.symlink_metadata().is_ok() {
+            // Never create a symlink whose target would resolve outside our
+            // install prefix — a package could otherwise smuggle writes to
+            // arbitrary paths (e.g. a symlink "lib -> /etc") past later
+            // entries in the same archive.
+            if symlink_escapes_prefix(&dest, &link_target, prefix) {
+                eprintln!(
+                    "  Warning: skipping symlink {:?} -> {:?} (escapes install prefix)",
+                    dest, link_target
+                );
+                continue;
+            }
+
+            // If dest is a real directory (not a symlink) — skip, never replace it
+            let is_real_dir = dest.is_dir()
+                && !dest.symlink_metadata()
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false);
+            if is_real_dir { continue; }
+
+            // If symlink already points to the correct target — skip
+            if let Ok(existing) = std::fs::read_link(&dest) {
+                if existing == link_target { continue; }
+            }
+
+            // Remove old symlink or file — but never a real directory
+            if dest.symlink_metadata().is_ok() && !dest.is_dir() {
                 let _ = fs::remove_file(&dest);
             }
 
-            std::os::unix::fs::symlink(&link_target, &dest)
-                .map_err(|e| format!("Cannot create symlink {:?}: {}", dest, e))?;
+            // Create symlink — if it fails (e.g. already exists as dir), skip silently
+            let _ = std::os::unix::fs::symlink(&link_target, &dest);
             placed.push(dest);
             continue;
         }
 
+        // ── Files ──────────────────────────────────────────────────────────
         if entry_type.is_file() {
-            entry.unpack(&dest)
-                .map_err(|e| format!("Failed to unpack {:?}: {}", dest, e))?;
+            // Overwrite existing files silently — this is correct install behavior
+            if let Err(e) = entry.unpack(&dest) {
+                // If unpack fails, skip this file rather than aborting the whole install
+                eprintln!("  Warning: skipping {:?}: {}", dest, e);
+                continue;
+            }
 
             let mode = entry.header().mode().unwrap_or(0o644);
-            let mut perms = fs::metadata(&dest).map_err(|e| e.to_string())?.permissions();
-            perms.set_mode(mode);
-            fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
+            if let Ok(meta) = fs::metadata(&dest) {
+                let mut perms = meta.permissions();
+                perms.set_mode(mode);
+                let _ = fs::set_permissions(&dest, perms);
+            }
+
+            // Best-effort RPATH fix so binaries/libraries pulled from a
+            // distro package can find our prefix's lib dir. Only touches
+            // real ELF files (checked via magic bytes), and merges with
+            // any existing RPATH rather than clobbering it.
+            if is_root() {
+                fix_rpath(&dest, &prefix.join("lib"));
+            }
 
             placed.push(dest);
         }
     }
 
     if is_root() {
+        // Make sure our lib dir is registered with the dynamic linker.
+        // Most distros already include /usr/local/lib by default, but this
+        // makes it explicit rather than relying on that assumption.
+        let conf_path = Path::new("/etc/ld.so.conf.d/chiral.conf");
+        let lib_line  = format!("{}\n", prefix.join("lib").display());
+        if fs::read_to_string(conf_path).map(|c| c != lib_line).unwrap_or(true) {
+            let _ = fs::write(conf_path, &lib_line);
+        }
         let _ = std::process::Command::new("ldconfig").status();
     }
 
     Ok(placed)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Install a single package without dep resolution (used internally)
+// ─────────────────────────────────────────────────────────────────────────────
 
-// PATH / ldconfig hint
+fn install_one(ui: &mut ChiralUI, package: &str, prefix: &Path) -> Result<(), String> {
+    let tmp = std::env::temp_dir().join(format!("chiral-{}.tar.gz", package));
+    let (source, version) = download_package(ui, package, &tmp)?;
 
+    ui.render_progress_frame(65, 100, &[format!("Extracting {} {}", package, version)], false);
+    let placed = extract(&tmp, prefix)?;
+    let _ = fs::remove_file(&tmp);
+
+    db_add(package, &version, &source, &placed)?;
+    ui.render_progress_frame(100, 100,
+        &[format!("✓ {} {} ({} files) [{}]", package, version, placed.len(), source)], false);
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATH hint
+// ─────────────────────────────────────────────────────────────────────────────
 
 fn path_hint(prefix: &Path) {
     let bin_dir = prefix.join("bin");
     let lib_dir = prefix.join("lib");
 
-    let in_path = std::env::var("PATH")
-        .unwrap_or_default()
-        .split(':')
-        .any(|p| Path::new(p) == bin_dir);
+    let in_path = std::env::var("PATH").unwrap_or_default()
+        .split(':').any(|p| Path::new(p) == bin_dir);
 
     if !in_path {
         eprintln!("\n💡 Add to PATH:");
@@ -858,7 +1174,7 @@ fn path_hint(prefix: &Path) {
     }
 
     if !is_root() {
-        let ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+        let ld      = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
         let lib_str = lib_dir.to_string_lossy();
         if !ld.contains(lib_str.as_ref()) {
             eprintln!("\n💡 If a package has shared libs, also add:");
@@ -873,7 +1189,7 @@ fn path_hint(prefix: &Path) {
 
 /// chiral install <package>
 pub fn install_binary(ui: &mut ChiralUI, package: &str) -> Result<(), String> {
-    ui.draw_header("2.0");
+    ui.draw_header("3.5.0");
     ui.render_progress_frame(0, 100, &["Checking...".to_string()], false);
 
     if db_is_installed(package) {
@@ -893,13 +1209,11 @@ pub fn install_binary(ui: &mut ChiralUI, package: &str) -> Result<(), String> {
 
     if !deps.is_empty() {
         println!("\n📦 Will install {} dependencies first:", deps.len());
-        for d in &deps {
-            println!("   + {}", d);
-        }
+        for d in &deps { println!("   + {}", d); }
         println!();
     }
 
-    // Install each dep in order (deepest first)
+    // Install deps in topological order
     let host_pm = detect_host_pm();
     for dep in &deps {
         if system_has(dep, &host_pm) {
@@ -910,7 +1224,7 @@ pub fn install_binary(ui: &mut ChiralUI, package: &str) -> Result<(), String> {
         install_one(ui, dep, &prefix)?;
     }
 
-    // Install the requested package itself
+    // Install the requested package
     println!("\n  Installing: {}", package);
     install_one(ui, package, &prefix)?;
 
@@ -921,22 +1235,34 @@ pub fn install_binary(ui: &mut ChiralUI, package: &str) -> Result<(), String> {
 
 /// chiral remove <package>
 pub fn remove_binary(ui: &mut ChiralUI, package: &str) -> Result<(), String> {
-    ui.draw_header("2.0");
+    ui.draw_header("3.5.0");
 
     if !db_is_installed(package) {
         return Err(format!("'{}' is not installed.", package));
     }
 
     let files = db_files_for(package)?;
+    let shared_elsewhere = db_files_owned_by_others(package)?;
     let mut removed = 0;
+    let mut kept_shared = 0;
     for f in &files {
+        // Don't delete a file another installed package still claims — it
+        // may genuinely need it (e.g. a shared file two packages both ship).
+        if shared_elsewhere.contains(f) {
+            kept_shared += 1;
+            continue;
+        }
         if f.exists() || f.symlink_metadata().is_ok() {
-            fs::remove_file(f)
-                .map_err(|e| format!("Cannot remove {}: {}", f.display(), e))?;
-            removed += 1;
+            // Never remove directories — only files and symlinks
+            if f.is_dir() { continue; }
+            if fs::remove_file(f).is_ok() { removed += 1; }
         }
     }
+    if kept_shared > 0 {
+        println!("  Kept {} file(s) still used by other installed packages.", kept_shared);
+    }
 
+    // Clean up empty dirs
     for f in &files {
         if let Some(parent) = f.parent() {
             let _ = fs::remove_dir(parent);
@@ -948,7 +1274,6 @@ pub fn remove_binary(ui: &mut ChiralUI, package: &str) -> Result<(), String> {
     }
 
     db_remove_entry(package)?;
-
     ui.render_progress_frame(100, 100, &[format!("Removed {} ({} files)", package, removed)], false);
     ui.finish();
     Ok(())
@@ -956,14 +1281,11 @@ pub fn remove_binary(ui: &mut ChiralUI, package: &str) -> Result<(), String> {
 
 /// chiral update <package>  /  chiral upgrade (pass "all")
 pub fn update_binary(ui: &mut ChiralUI, package: &str) -> Result<(), String> {
-    ui.draw_header("2.0");
+    ui.draw_header("3.5.0");
 
     if package == "all" {
         let installed = db_list()?;
-        if installed.is_empty() {
-            println!("Nothing to upgrade.");
-            return Ok(());
-        }
+        if installed.is_empty() { println!("Nothing to upgrade."); return Ok(()); }
         for (name, _, _) in installed {
             println!("Upgrading {}...", name);
             remove_binary(ui, &name)?;
@@ -990,8 +1312,8 @@ pub fn update_binary(ui: &mut ChiralUI, package: &str) -> Result<(), String> {
     let _ = fs::remove_file(&tmp);
 
     db_add(package, &version, &source, &placed)?;
-
-    ui.render_progress_frame(100, 100, &[format!("Updated {} → {} [{}]", package, version, source)], false);
+    ui.render_progress_frame(100, 100,
+        &[format!("Updated {} → {} [{}]", package, version, source)], false);
     ui.finish();
     Ok(())
 }
@@ -1011,9 +1333,9 @@ pub fn search_packages(query: &str) -> Result<(), String> {
         return Err(format!("Cannot reach package index (HTTP {})", response.status()));
     }
 
-    let text: String = response.text().map_err(|e| e.to_string())?;
-    let body: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| format!("Failed to parse index: {}", e))?;
+    let body: serde_json::Value = serde_json::from_str(
+        &response.text().map_err(|e| e.to_string())?
+    ).map_err(|e| format!("Failed to parse index: {}", e))?;
 
     let installed   = db_list().unwrap_or_default();
     let query_lower = query.to_lowercase();
@@ -1043,10 +1365,7 @@ pub fn search_packages(query: &str) -> Result<(), String> {
 pub fn list_installed() -> Result<(), String> {
     let entries = db_list()?;
 
-    if entries.is_empty() {
-        println!("No packages installed.");
-        return Ok(());
-    }
+    if entries.is_empty() { println!("No packages installed."); return Ok(()); }
 
     println!("Installed packages:");
     println!("{}", "─".repeat(55));
@@ -1060,100 +1379,10 @@ pub fn list_installed() -> Result<(), String> {
     Ok(())
 }
 
-/// Get version string from the host package manager
-fn get_system_version(package: &str, host_pm: &HostPm) -> Option<String> {
-    let output = match host_pm {
-        HostPm::Pacman => std::process::Command::new("pacman")
-            .args(["-Q", package])
-            .output().ok()?,
-        HostPm::Apt => std::process::Command::new("dpkg")
-            .args(["-s", package])
-            .output().ok()?,
-        HostPm::Rpm => std::process::Command::new("rpm")
-            .args(["-q", package])
-            .output().ok()?,
-        HostPm::Unknown => return None,
-    };
-
-    let out = String::from_utf8_lossy(&output.stdout).to_string();
-    match host_pm {
-        // pacman -Q returns "pkgname version"
-        HostPm::Pacman => out.split_whitespace().nth(1).map(|s| s.to_string()),
-        // dpkg -s returns "Version: x.x.x" in the output
-        HostPm::Apt => out.lines()
-            .find(|l| l.starts_with("Version:"))
-            .and_then(|l| l.split(':').nth(1))
-            .map(|s| s.trim().to_string()),
-        HostPm::Rpm => Some(out.trim().to_string()),
-        HostPm::Unknown => None,
-    }
-}
-
-/// Detect how a package got onto the system — chiral, pacman, dpkg, rustup, PATH, etc.
-fn detect_install_source(package: &str, host_pm: &HostPm) -> String {
-    // 1. Check pacman/dpkg/rpm
-    let pm_has = match host_pm {
-        HostPm::Pacman => std::process::Command::new("pacman")
-            .args(["-Q", package])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status().map(|s| s.success()).unwrap_or(false),
-        HostPm::Apt => std::process::Command::new("dpkg")
-            .args(["-s", package])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status().map(|s| s.success()).unwrap_or(false),
-        HostPm::Rpm => std::process::Command::new("rpm")
-            .args(["-q", package])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status().map(|s| s.success()).unwrap_or(false),
-        HostPm::Unknown => false,
-    };
-
-    if pm_has {
-        return match host_pm {
-            HostPm::Pacman => "pacman".to_string(),
-            HostPm::Apt    => "apt/dpkg".to_string(),
-            HostPm::Rpm    => "rpm".to_string(),
-            HostPm::Unknown => "system".to_string(),
-        };
-    }
-
-    // 2. Check rustup (for rust, cargo, rustc)
-    if ["rust", "rustc", "cargo", "rustup"].contains(&package) {
-        let rustup_check = std::process::Command::new("rustup")
-            .arg("show")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status().map(|s| s.success()).unwrap_or(false);
-        if rustup_check { return "rustup".to_string(); }
-    }
-
-    // 3. Check if binary exists on PATH
-    let on_path = std::process::Command::new("sh")
-        .args(["-c", &format!("command -v {}", package)])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status().map(|s| s.success()).unwrap_or(false);
-    if on_path { return "manual/PATH".to_string(); }
-
-    // 4. pkg-config
-    let pc = std::process::Command::new("pkg-config")
-        .args(["--exists", package])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status().map(|s| s.success()).unwrap_or(false);
-    if pc { return "manual/pkg-config".to_string(); }
-
-    "unknown".to_string()
-}
-
 /// chiral info <package>
 pub fn info_package(package: &str) -> Result<(), String> {
     let host_pm = detect_host_pm();
 
-    // Not in chiral DB — check if it exists on the system anyway
     if !db_is_installed(package) {
         if system_has(package, &host_pm) {
             let source  = detect_install_source(package, &host_pm);
@@ -1179,11 +1408,7 @@ pub fn info_package(package: &str) -> Result<(), String> {
 
     let files  = db_files_for(package)?;
     let prefix = install_prefix()?;
-
-    // Also show deps from Arch if available
-    let deps = arch_query(package)
-        .map(|p| p.depends)
-        .unwrap_or_default();
+    let deps   = arch_query(package).map(|p| p.depends).unwrap_or_default();
 
     println!("{}", "─".repeat(55));
     println!("  Package : {}", package);
@@ -1191,11 +1416,7 @@ pub fn info_package(package: &str) -> Result<(), String> {
     println!("  Source  : {}", source);
     println!("  Prefix  : {}", prefix.display());
     println!("  Files   : {}", files.len());
-
-    if !deps.is_empty() {
-        println!("  Deps    : {}", deps.join(", "));
-    }
-
+    if !deps.is_empty() { println!("  Deps    : {}", deps.join(", ")); }
     println!("{}", "─".repeat(55));
 
     let mut bins: Vec<&PathBuf> = Vec::new();
@@ -1206,11 +1427,11 @@ pub fn info_package(package: &str) -> Result<(), String> {
 
     for f in &files {
         let s = f.to_string_lossy();
-        if s.contains("/bin/")      { bins.push(f); }
-        else if s.contains("/lib/") { libs.push(f); }
+        if s.contains("/bin/")          { bins.push(f); }
+        else if s.contains("/lib/")     { libs.push(f); }
         else if s.contains("/include/") { hdrs.push(f); }
-        else if s.contains("/man/") { mans.push(f); }
-        else                        { rest.push(f); }
+        else if s.contains("/man/")     { mans.push(f); }
+        else                            { rest.push(f); }
     }
 
     let print_group = |label: &str, group: &[&PathBuf]| {
@@ -1225,15 +1446,13 @@ pub fn info_package(package: &str) -> Result<(), String> {
     print_group("Headers",   &hdrs);
     print_group("Man pages", &mans);
     print_group("Other",     &rest);
-
     println!("{}", "─".repeat(55));
     Ok(())
 }
 
-/// chiral deps <package> — show what would be installed without installing
+/// chiral deps <package> — dry run
 pub fn show_deps(package: &str) -> Result<(), String> {
     println!("Resolving dependencies for '{}'...", package);
-
     let deps = resolve_deps(package)?;
 
     if deps.is_empty() {
@@ -1252,10 +1471,71 @@ pub fn show_deps(package: &str) -> Result<(), String> {
 }
 
 
-/// chiral self-update — downloads latest binary from GitHub releases
+// System version + source detection helpers
+
+
+fn get_system_version(package: &str, host_pm: &HostPm) -> Option<String> {
+    let output = match host_pm {
+        HostPm::Pacman  => std::process::Command::new("pacman").args(["-Q", package]).output().ok()?,
+        HostPm::Apt     => std::process::Command::new("dpkg").args(["-s", package]).output().ok()?,
+        HostPm::Rpm     => std::process::Command::new("rpm").args(["-q", package]).output().ok()?,
+        HostPm::Unknown => return None,
+    };
+
+    let out = String::from_utf8_lossy(&output.stdout).to_string();
+    match host_pm {
+        HostPm::Pacman  => out.split_whitespace().nth(1).map(|s| s.to_string()),
+        HostPm::Apt     => out.lines()
+            .find(|l| l.starts_with("Version:"))
+            .and_then(|l| l.split(':').nth(1))
+            .map(|s| s.trim().to_string()),
+        HostPm::Rpm     => Some(out.trim().to_string()),
+        HostPm::Unknown => None,
+    }
+}
+
+fn detect_install_source(package: &str, host_pm: &HostPm) -> String {
+    let pm_has = match host_pm {
+        HostPm::Pacman  => std::process::Command::new("pacman").args(["-Q", package])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false),
+        HostPm::Apt     => std::process::Command::new("dpkg").args(["-s", package])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false),
+        HostPm::Rpm     => std::process::Command::new("rpm").args(["-q", package])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false),
+        HostPm::Unknown => false,
+    };
+
+    if pm_has {
+        return match host_pm {
+            HostPm::Pacman  => "pacman".to_string(),
+            HostPm::Apt     => "apt/dpkg".to_string(),
+            HostPm::Rpm     => "rpm".to_string(),
+            HostPm::Unknown => "system".to_string(),
+        };
+    }
+
+    if ["rust", "rustc", "cargo", "rustup"].contains(&package) {
+        let found = std::process::Command::new("rustup").arg("show")
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false);
+        if found { return "rustup".to_string(); }
+    }
+
+    let on_path = std::process::Command::new("which")
+        .arg(package)
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .status().map(|s| s.success()).unwrap_or(false);
+    if on_path { return "manual/PATH".to_string(); }
+
+    "unknown".to_string()
+}
+
+/// chiral self-update
 pub fn self_update() -> Result<(), String> {
     const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-    const RELEASES_API: &str = "https://api.github.com/repos/Amaterus1125/Chiral-CrossDistro-Package-Manager/releases/latest";
 
     println!("Current version: v{}", CURRENT_VERSION);
     println!("Checking for updates...");
@@ -1284,20 +1564,51 @@ pub fn self_update() -> Result<(), String> {
 
     println!("New version available: v{} → updating...", latest);
 
-    let assets = json["assets"].as_array()
-        .ok_or("No assets in release")?;
+    let assets = json["assets"].as_array().ok_or("No assets in release")?;
 
-    let binary_url = assets.iter()
+    let asset = assets.iter()
         .find(|a| {
-    let name = a["name"].as_str().unwrap_or("");
-    name == "chiral" || name.starts_with("chiral-x86_64")
-})
-        .and_then(|a| a["browser_download_url"].as_str())
-        .ok_or("No 'chiral' binary found in release assets")?
+            let name = a["name"].as_str().unwrap_or("");
+            name == "chiral" || name.starts_with("chiral-x86_64")
+        })
+        .ok_or("No 'chiral' binary found in release assets")?;
+
+    let binary_url = asset["browser_download_url"].as_str()
+        .ok_or("Release asset has no download URL")?
         .to_string();
+
+    // GitHub computes this SHA-256 itself at upload time — it isn't
+    // something the release author can edit after the fact via the tag
+    // body or asset metadata. Assets uploaded before GitHub added this
+    // (mid-2025) will have `digest: null`; that's treated as "unverifiable"
+    // rather than silently trusted, since this download is about to replace
+    // the binary that's currently running.
+    let expected_digest = asset["digest"].as_str()
+        .and_then(|d| d.strip_prefix("sha256:"))
+        .map(|s| s.to_string());
 
     let tmp = PathBuf::from("/var/tmp/chiral-new");
     download(&binary_url, &tmp)?;
+
+    match expected_digest {
+        Some(digest) => {
+            verify_file_sha256(&tmp, &digest, "chiral update binary")?;
+            println!("✓ Checksum verified (sha256:{}...)", &digest[..12.min(digest.len())]);
+        }
+        None => {
+            let allow = std::env::var("CHIRAL_ALLOW_UNVERIFIED_UPDATE").as_deref() == Ok("1");
+            if !allow {
+                let _ = fs::remove_file(&tmp);
+                return Err(
+                    "This release asset has no GitHub-provided checksum (predates GitHub's \
+                     digest feature), so chiral cannot verify it before replacing itself. \
+                     Verify it by hand and update manually, or re-run with \
+                     CHIRAL_ALLOW_UNVERIFIED_UPDATE=1 if you accept the risk.".to_string()
+                );
+            }
+            eprintln!("⚠ Proceeding WITHOUT checksum verification (CHIRAL_ALLOW_UNVERIFIED_UPDATE=1 set).");
+        }
+    }
 
     std::fs::set_permissions(&tmp,
         std::os::unix::fs::PermissionsExt::from_mode(0o755))
@@ -1306,10 +1617,15 @@ pub fn self_update() -> Result<(), String> {
     let current = std::env::current_exe()
         .map_err(|e| format!("Cannot find current binary: {}", e))?;
 
-std::fs::copy(&tmp, &current)
-    .map_err(|e| format!("Cannot replace binary (try sudo): {}", e))?;
-std::fs::remove_file(&tmp).ok();
+    std::fs::copy(&tmp, &current)
+        .map_err(|e| format!("Cannot replace binary (try sudo): {}", e))?;
+    std::fs::remove_file(&tmp).ok();
 
     println!("✓ Updated to v{} — restart chiral to use new version.", latest);
     Ok(())
 }
+
+
+// Tests live in their own file — see src/host_safety_tests.rs
+#[cfg(test)]
+mod host_safety_tests;
