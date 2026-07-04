@@ -12,3 +12,4 @@ serde_json = "1.0"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 libc = "0.2"
 crossterm = "0.27"
+sha2 = "0.10"
