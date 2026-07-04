@@ -2,6 +2,7 @@
 name = "chiral"
 version = "3.5.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 flate2 = "1.0"
