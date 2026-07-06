@@ -284,4 +284,4 @@ The name comes from chirality in chemistry — molecules that are mirror images 
 
 ## License
 
-MIT — do whatever you want with it.
+GPL-3.0 or above — read the LICENSE page.
