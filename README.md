@@ -46,7 +46,7 @@ If a package exists anywhere in that chain, Chiral finds it, resolves all its de
 | 👤 **Root and user modes** | System-wide as root, or into `~/.local` as a regular user |
 | 🔄 **Weekly auto-sync** | GitHub Actions keeps your package repo updated every Sunday automatically |
 | ⬆️ **Self-updating** | `chiral self-update` downloads and replaces the binary from GitHub releases |
-| 🦀 **100% static binary** | Built with musl — zero runtime dependencies, runs on any Linux |
+| 🦀 **100% static binary** |  Built with musl — zero runtime dependencies, runs on any Linux |
 
 ---
 
