@@ -1,3 +1,7 @@
+
+
+// KIND OF OUTDATED FILE , WILL MAKE A NEW ONE WHEN THE MAIN FILES ARE READY
+
 use crossterm::style::{Color, Stylize};
 use std::io::{self, Write};
 
