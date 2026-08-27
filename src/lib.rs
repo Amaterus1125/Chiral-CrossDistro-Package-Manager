@@ -18,7 +18,7 @@ const ARCH_MIRROR: &str  = "https://mirror.rackspace.com/archlinux";
 const RELEASES_API: &str = "https://api.github.com/repos/Amaterus1125/Chiral-CrossDistro-Package-Manager/releases/latest";
 
 /// Packages that are fundamental to every Linux system and must NEVER be
-/// downloaded from Arch/Debian — they conflict with LFS filesystem layout.
+/// downloaded from Arch/Debian — they conflict with LFS filesystem layou
 const NEVER_INSTALL: &[&str] = &[
     "filesystem", "linux-api-headers", "iana-etc", "tzdata",
     "glibc", "sh", "bash", "coreutils", "util-linux", "systemd",
@@ -55,7 +55,7 @@ fn db_file() -> Result<PathBuf, String> {
 }
 
 // File tracking DB
-// Format:  [pkgname=1.2.3|debian]
+// Format for files likee  [pkgname=1.2.3|debian]
 //          /usr/local/bin/foo
 
 
@@ -142,11 +142,8 @@ fn db_get_entry(package: &str) -> Option<(String, String)> {
         .map(|(_, v, s)| (v, s))
 }
 
-/// Strip characters that would corrupt the DB's own `[name=version|source]`
-/// delimiter format. Applied to any value (package name, version, source)
-/// before it's written, regardless of whether that value originated from
-/// user input or from a package's own untrusted metadata (Depends fields,
-/// Arch API JSON, etc).
+
+
 fn sanitize_db_field(s: &str) -> String {
     s.chars()
         .map(|c| match c {
@@ -156,10 +153,7 @@ fn sanitize_db_field(s: &str) -> String {
         .collect()
 }
 
-/// Write the DB file atomically: write to a temp file in the same directory,
-/// then rename it into place. A rename on the same filesystem is atomic, so
-/// a crash or kill mid-write can never leave installed.db truncated or
-/// half-written — readers only ever see the old file or the new one.
+
 fn db_write_atomic(content: &str) -> Result<(), String> {
     let dir  = db_dir()?;
     let file = db_file()?;
@@ -207,7 +201,7 @@ fn db_remove_entry(package: &str) -> Result<(), String> {
 }
 
 
-// Download
+
 
 
 fn download(url: &str, dest: &Path) -> Result<(), String> {
@@ -229,32 +223,6 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
 }
 
 
-// Checksum verification
-//
-// Every network path that lands a file on disk (packages *and* the
-// self-update binary) used to be trusted unconditionally. The upstreams
-// don't all offer the same integrity guarantees, so verification is
-// per-source rather than one generic "hash matches" helper bolted on top:
-//
-//   - Self-update (GitHub Releases): GitHub itself computes a SHA-256
-//     `digest` for every uploaded asset at upload time — not something the
-//     release author can edit after the fact. We verify against that, and
-//     refuse to self-replace if it's missing, unless explicitly overridden.
-//   - Our own CHPM package repo: we control it, so a package can ship a
-//     `<name>.tar.gz.sha256` sidecar next to the tarball. Verified if
-//     present. Absent just means the package predates this feature — that
-//     gets a loud warning, not a silent pass.
-//   - Arch fallback: the repo's own sync database (`<repo>.db` — the same
-//     file `pacman` itself trusts) carries a SHA256SUM per package/version.
-//   - Debian fallback: the repo's own `Packages` index (the same file `apt`
-//     itself trusts) carries a SHA256 per pool path.
-//
-// None of this is signature verification — it doesn't prove the upstream
-// index/API itself is honest, only that the bytes we saved match what that
-// index says they should be. That closes "a mirror handed me a corrupted or
-// substituted file" and "a MITM tampered with the download in transit", not
-// "the upstream's own index was compromised". Worth being explicit about
-// that boundary rather than implying more than this actually buys us.
 
 
 fn sha256_hex_of_file(path: &Path) -> Result<String, String> {
@@ -285,10 +253,7 @@ fn checksum_matches(actual_hex: &str, expected_hex: &str) -> bool {
     actual_hex.trim().eq_ignore_ascii_case(expected_hex.trim())
 }
 
-/// Hash `path` and compare against `expected_hex`. On mismatch the file is
-/// deleted immediately — a corrupted or substituted download must never
-/// survive to be extracted, installed, or (for self-update) executed just
-/// because a later step forgot to check the return value.
+
 fn verify_file_sha256(path: &Path, expected_hex: &str, what: &str) -> Result<(), String> {
     let actual = sha256_hex_of_file(path)?;
     if !checksum_matches(&actual, expected_hex) {
@@ -301,13 +266,7 @@ fn verify_file_sha256(path: &Path, expected_hex: &str, what: &str) -> Result<(),
     Ok(())
 }
 
-/// Best-effort check against our own CHPM package repo's optional
-/// `<name>.tar.gz.sha256` sidecar. Returns Ok(()) both when the sidecar is
-/// missing/malformed (nothing to check against yet — warn and proceed) and
-/// when it matches. Only returns Err on an actual mismatch, since that's a
-/// real anomaly (stale mirror, corrupted upload, tampering) worth aborting
-/// the whole install for, rather than silently falling back to another
-/// source and hiding it.
+
 fn verify_chpm_package_checksum(package: &str, tarball: &Path) -> Result<(), String> {
     let sidecar_url = format!("{}/{}.tar.gz.sha256", SERVER, package);
 
@@ -327,7 +286,7 @@ fn verify_chpm_package_checksum(package: &str, tarball: &Path) -> Result<(), Str
         }
     };
 
-    // Accept a bare hex digest or `sha256sum`-style "<hex>  <filename>".
+
     let expected = body.split_whitespace().next().unwrap_or("");
     if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
         eprintln!("  ⚠ Checksum file for '{}' is malformed — installing unverified.", package);
@@ -337,11 +296,6 @@ fn verify_chpm_package_checksum(package: &str, tarball: &Path) -> Result<(), Str
     verify_file_sha256(tarball, expected, &format!("package '{}'", package))
 }
 
-/// Fetch and parse the Arch sync database for `pkg`'s repo, returning the
-/// SHA256SUM the repo itself published for this exact package/version.
-/// Assumes the sync db is gzip-compressed, which is the default for
-/// pacman-produced `.db` files; if a mirror ever changes that, this will
-/// need a zstd path added alongside it.
 fn arch_fetch_sha256(pkg: &ArchPkg) -> Result<String, String> {
     let db_url = format!("{}/{}/os/x86_64/{}.db", ARCH_MIRROR, pkg.repo, pkg.repo);
     let mut resp = reqwest::blocking::get(&db_url)
@@ -379,11 +333,7 @@ fn arch_fetch_sha256(pkg: &ArchPkg) -> Result<String, String> {
     Err(format!("'{}' not found in {} sync db (version mismatch?)", pkg.pkgname, pkg.repo))
 }
 
-/// Fetch Debian's package index and return the SHA256 published for the
-/// given pool path (e.g. "pool/main/g/glibc/libc6_...deb"). This is the
-/// same index `apt` itself trusts — normally backed by the Release file's
-/// signature, which this does not check, so it closes "did I get the file
-/// the index says I should have" but not "is this repo compromised".
+
 fn debian_fetch_sha256(pool_path: &str) -> Result<String, String> {
     let idx_url = "https://deb.debian.org/debian/dists/stable/main/binary-amd64/Packages.gz";
     let mut resp = reqwest::blocking::get(idx_url)
@@ -414,7 +364,7 @@ fn debian_fetch_sha256(pool_path: &str) -> Result<String, String> {
 }
 
 
-// Arch API
+
 
 
 struct ArchPkg {
@@ -527,13 +477,7 @@ fn try_arch(package: &str, dest: &Path) -> Result<(String, Vec<String>), String>
     Ok((version, deps))
 }
 
-// Debian fallback
 
-
-/// Pull the pool-relative path out of a deb.debian.org download URL, e.g.
-/// "https://deb.debian.org/debian/pool/main/g/glibc/libc6_...deb" ->
-/// "pool/main/g/glibc/libc6_...deb" — this is exactly the `Filename:` field
-/// the Packages index uses, so it's the key for checksum lookup.
 fn debian_relative_path(url: &str) -> Option<String> {
     url.find("pool/").map(|i| url[i..].to_string())
 }
@@ -631,7 +575,7 @@ fn try_debian(package: &str, dest: &Path) -> Result<String, String> {
 }
 
 
-// Dependency resolution
+
 
 
 fn strip_ver(dep: &str) -> String {
@@ -640,7 +584,7 @@ fn strip_ver(dep: &str) -> String {
 }
 
 
-// Host OS detection
+
 
 
 enum HostPm { Pacman, Apt, Rpm, Unknown }
@@ -658,8 +602,8 @@ fn detect_host_pm() -> HostPm {
     HostPm::Unknown
 }
 
-/// Smart system check — 6 layers deep.
-/// Returns true if the dep is already satisfied by ANY means on this system.
+/// Smart system check —
+
 fn system_has(dep: &str, host_pm: &HostPm) -> bool {
     // 0. Never-install list — always pretend these are present
     if NEVER_INSTALL.contains(&dep) { return true; }
@@ -685,7 +629,7 @@ fn system_has(dep: &str, host_pm: &HostPm) -> bool {
     };
     if pm_found { return true; }
 
-    // 3. Binary on PATH — invoke `which` directly (no shell), so a dependency
+    // 3. Binary on PATH invoke which directly (no shell), so a dependency
     // name containing shell metacharacters can never be interpreted as a command.
     let bin_found = std::process::Command::new("which")
         .arg(dep)
@@ -693,7 +637,7 @@ fn system_has(dep: &str, host_pm: &HostPm) -> bool {
         .status().map(|s| s.success()).unwrap_or(false);
     if bin_found { return true; }
 
-    // 4. Shared lib via ldconfig + direct paths
+    // 4. Shared lib via ldconfig with soo direct paths
     if dep.contains(".so") {
         let ldconfig_found = std::process::Command::new("sh")
             .args(["-c", &format!("ldconfig -p 2>/dev/null | grep -q '{}'", dep)])
@@ -705,7 +649,7 @@ fn system_has(dep: &str, host_pm: &HostPm) -> bool {
         }
     }
 
-    // 5. pkg-config — catches manually compiled libs
+    // 5. pkg-config  catches manually compiled libs
     let pc_found = std::process::Command::new("pkg-config")
         .args(["--exists", dep])
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
@@ -725,7 +669,7 @@ fn system_has(dep: &str, host_pm: &HostPm) -> bool {
         if found { return true; }
     }
 
-    // 6. Direct filesystem scan — catches manual installs from source
+    // 6. Direct filesystem scan ,catches manual installs from source
     let search_name = dep.trim_start_matches("lib");
     for path in &[
         format!("/usr/bin/{}", dep),
@@ -836,7 +780,7 @@ fn download_package(
     package: &str,
     dest: &Path,
 ) -> Result<(String, String), String> {
-    // Try 1: GitHub
+    // Try 1: GitHub repos on wildd
     let url = format!("{}/{}.tar.gz", SERVER, package);
     ui.render_progress_frame(20, 100, &[format!("Trying GitHub packages/{}.tar.gz", package)], false);
     if download(&url, dest).is_ok() {
@@ -846,13 +790,13 @@ fn download_package(
         return Ok(("github".to_string(), "latest".to_string()));
     }
 
-    // Try 2: Debian
+    // Try 2: Debian mirrors
     ui.render_progress_frame(35, 100, &["Not in repo — trying Debian stable...".to_string()], false);
     if let Ok(version) = try_debian(package, dest) {
         return Ok(("debian".to_string(), version));
     }
 
-    // Try 3: Arch
+    // Try 3: Arch mirros like 100 of them
     ui.render_progress_frame(50, 100, &["Trying Arch Linux repos...".to_string()], false);
     if let Ok((version, _)) = try_arch(package, dest) {
         return Ok(("arch".to_string(), version));
@@ -865,33 +809,21 @@ fn download_package(
 }
 
 
-// Extract — smart symlink and file handling, never breaks existing dirs
 
-
-
-// Path routing (cross-distro layout normalization)
 
 
 /// True if `s` looks like a Debian/Ubuntu multiarch triplet directory name
-/// (e.g. "x86_64-linux-gnu", "aarch64-linux-gnu", "arm-linux-gnueabihf").
+
 fn is_multiarch_triplet(s: &str) -> bool {
     s.ends_with("-linux-gnu") || s.ends_with("-linux-gnueabihf") || s.ends_with("-linux-musl")
 }
 
-/// Map a package's internal path to where it should land under our prefix.
-///
-/// Returns `None` for entries that should never be installed (distro packaging
-/// metadata that isn't part of the actual payload).
-///
-/// Unlike a "route by file type, keep only the basename" approach, this keeps
-/// every directory's internal structure intact (pkgconfig/, cmake/, python
-/// site-packages, systemd units, etc.) — the only thing it collapses is the
 /// Debian multiarch triplet component, which is the one thing that actually
 /// needs collapsing for the dynamic linker to find things without extra config.
 fn normalize_rel_path(safe: &Path) -> Option<PathBuf> {
     let s = safe.to_string_lossy();
 
-    // Distro/package-manager metadata — never part of the installed payload.
+ 
     if s == ".PKGINFO" || s == ".MTREE" || s == ".BUILDINFO" || s == ".INSTALL"
         || s == ".changelog" || s.starts_with("DEBIAN/") {
         return None;
@@ -913,11 +845,7 @@ fn normalize_rel_path(safe: &Path) -> Option<PathBuf> {
 
     if comps.is_empty() { return None; }
 
-    // Collapse "lib/<multiarch-triplet>/rest..." -> "lib/rest...", and
-    // normalize lib32/lib64 -> lib, WITHOUT discarding the remainder of the
-    // path. This is what actually fixes multiarch fragmentation: the linker
-    // only needs to look in one place, and nothing else about the package's
-    // internal layout gets disturbed.
+
     if comps.len() >= 2 {
         let is_libdir = comps[0] == "lib" || comps[0] == "lib32" || comps[0] == "lib64";
         if is_libdir && is_multiarch_triplet(&comps[1]) {
@@ -932,18 +860,14 @@ fn normalize_rel_path(safe: &Path) -> Option<PathBuf> {
     Some(comps.iter().collect())
 }
 
-/// Check for the ELF magic bytes so we never hand a non-ELF file to patchelf
-/// just because its name happened to contain ".so".
+
 fn is_elf_file(path: &Path) -> bool {
     let Ok(mut f) = File::open(path) else { return false };
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic).is_ok() && magic == *b"\x7fELF"
 }
 
-/// Fix a binary/library's RPATH so it can find libraries under our prefix,
-/// without discarding whatever RPATH it already had (some binaries genuinely
-/// need multiple search paths). Best-effort: if patchelf isn't installed or
-/// the file isn't ELF, this is a silent no-op rather than a hard failure.
+
 fn fix_rpath(dest: &Path, lib_dir: &Path) {
     if !is_elf_file(dest) { return; }
 
@@ -973,9 +897,7 @@ fn fix_rpath(dest: &Path, lib_dir: &Path) {
         .status();
 }
 
-/// Resolve "." and ".." components without touching the filesystem (the
-/// target of a symlink we're about to create usually doesn't exist yet, so
-/// we can't use fs::canonicalize on it).
+
 fn normalize_lexically(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {
@@ -988,9 +910,7 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     out
 }
 
-/// True if a symlink at `dest` pointing to `link_target` would resolve to
-/// somewhere outside `prefix`. Catches both absolute-path escapes
-/// (`-> /etc/passwd`) and relative escapes (`-> ../../../../etc/passwd`).
+
 fn symlink_escapes_prefix(dest: &Path, link_target: &Path, prefix: &Path) -> bool {
     let target_abs = if link_target.is_absolute() {
         link_target.to_path_buf()
@@ -1028,9 +948,7 @@ fn extract(tarball: &Path, prefix: &Path) -> Result<Vec<PathBuf>, String> {
 
         if safe.as_os_str().is_empty() { continue; }
 
-        // Route the package's internal path to our normalized layout.
-        // Skips distro packaging metadata and collapses multiarch lib dirs
-        // while preserving the rest of the internal directory structure.
+      
         let rel: PathBuf = match normalize_rel_path(&safe) {
             Some(r) => r,
             None => continue,
@@ -1043,7 +961,7 @@ fn extract(tarball: &Path, prefix: &Path) -> Result<Vec<PathBuf>, String> {
 
         // directories
         if entry_type.is_dir() {
-            // Always use create_dir_all — never fails if dir already exists
+        
             let _ = fs::create_dir_all(&dest);
             continue;
         }
@@ -1060,10 +978,7 @@ fn extract(tarball: &Path, prefix: &Path) -> Result<Vec<PathBuf>, String> {
                 .ok_or("Symlink has no target")?;
             let link_target = PathBuf::from(link_target.as_ref());
 
-            // Never create a symlink whose target would resolve outside our
-            // install prefix — a package could otherwise smuggle writes to
-            // arbitrary paths (e.g. a symlink "lib -> /etc") past later
-            // entries in the same archive.
+    
             if symlink_escapes_prefix(&dest, &link_target, prefix) {
                 eprintln!(
                     "  Warning: skipping symlink {:?} -> {:?} (escapes install prefix)",
@@ -1095,7 +1010,7 @@ fn extract(tarball: &Path, prefix: &Path) -> Result<Vec<PathBuf>, String> {
             continue;
         }
 
-        // ── Files ──────────────────────────────────────────────────────────
+     
         if entry_type.is_file() {
             // Overwrite existing files silently — this is correct install behavior
             if let Err(e) = entry.unpack(&dest) {
@@ -1111,10 +1026,7 @@ fn extract(tarball: &Path, prefix: &Path) -> Result<Vec<PathBuf>, String> {
                 let _ = fs::set_permissions(&dest, perms);
             }
 
-            // Best-effort RPATH fix so binaries/libraries pulled from a
-            // distro package can find our prefix's lib dir. Only touches
-            // real ELF files (checked via magic bytes), and merges with
-            // any existing RPATH rather than clobbering it.
+         
             if is_root() {
                 fix_rpath(&dest, &prefix.join("lib"));
             }
@@ -1124,9 +1036,7 @@ fn extract(tarball: &Path, prefix: &Path) -> Result<Vec<PathBuf>, String> {
     }
 
     if is_root() {
-        // Make sure our lib dir is registered with the dynamic linker.
-        // Most distros already include /usr/local/lib by default, but this
-        // makes it explicit rather than relying on that assumption.
+   
         let conf_path = Path::new("/etc/ld.so.conf.d/chiral.conf");
         let lib_line  = format!("{}\n", prefix.join("lib").display());
         if fs::read_to_string(conf_path).map(|c| c != lib_line).unwrap_or(true) {
@@ -1138,9 +1048,6 @@ fn extract(tarball: &Path, prefix: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(placed)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Install a single package without dep resolution (used internally)
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn install_one(ui: &mut ChiralUI, package: &str, prefix: &Path) -> Result<(), String> {
     let tmp = std::env::temp_dir().join(format!("chiral-{}.tar.gz", package));
@@ -1156,9 +1063,6 @@ fn install_one(ui: &mut ChiralUI, package: &str, prefix: &Path) -> Result<(), St
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PATH hint
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn path_hint(prefix: &Path) {
     let bin_dir = prefix.join("bin");
@@ -1168,7 +1072,7 @@ fn path_hint(prefix: &Path) {
         .split(':').any(|p| Path::new(p) == bin_dir);
 
     if !in_path {
-        eprintln!("\n💡 Add to PATH:");
+        eprintln!("\n Add to PATH:");
         eprintln!("   export PATH=\"{}:$PATH\"", bin_dir.display());
         eprintln!("   Add that line to ~/.bashrc to make it permanent.");
     }
@@ -1177,14 +1081,14 @@ fn path_hint(prefix: &Path) {
         let ld      = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
         let lib_str = lib_dir.to_string_lossy();
         if !ld.contains(lib_str.as_ref()) {
-            eprintln!("\n💡 If a package has shared libs, also add:");
+            eprintln!("\n If a package has shared libs, also add:");
             eprintln!("   export LD_LIBRARY_PATH=\"{}:$LD_LIBRARY_PATH\"", lib_dir.display());
         }
     }
 }
 
 
-// PUBLIC API
+
 
 
 /// chiral install <package>
@@ -1208,7 +1112,7 @@ pub fn install_binary(ui: &mut ChiralUI, package: &str) -> Result<(), String> {
     let deps = resolve_deps(package)?;
 
     if !deps.is_empty() {
-        println!("\n📦 Will install {} dependencies first:", deps.len());
+        println!("\n Will install {} dependencies first:", deps.len());
         for d in &deps { println!("   + {}", d); }
         println!();
     }
@@ -1577,12 +1481,7 @@ pub fn self_update() -> Result<(), String> {
         .ok_or("Release asset has no download URL")?
         .to_string();
 
-    // GitHub computes this SHA-256 itself at upload time — it isn't
-    // something the release author can edit after the fact via the tag
-    // body or asset metadata. Assets uploaded before GitHub added this
-    // (mid-2025) will have `digest: null`; that's treated as "unverifiable"
-    // rather than silently trusted, since this download is about to replace
-    // the binary that's currently running.
+
     let expected_digest = asset["digest"].as_str()
         .and_then(|d| d.strip_prefix("sha256:"))
         .map(|s| s.to_string());
