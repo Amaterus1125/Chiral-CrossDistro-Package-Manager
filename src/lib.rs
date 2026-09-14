@@ -771,9 +771,8 @@ pub fn resolve_deps(package: &str) -> Result<Vec<String>, String> {
     Ok(result)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Download with 3-way fallback — returns (source, version)
-// ─────────────────────────────────────────────────────────────────────────────
+// Download with 3-way fallback  of arch , debian and my own LFS packages if i ever upload— returns (source, version)
+
 
 fn download_package(
     ui: &mut ChiralUI,
