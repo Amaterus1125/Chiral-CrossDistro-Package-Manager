@@ -45,7 +45,7 @@ echo "Chiral installed to $INSTALL_DIR/chiral"
 if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo " Add chiral to your PATH by running:"
+    echo " Add chiral package manager to your PATH by running: "
     echo ""
     echo "   echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.bashrc"
     echo "   source ~/.bashrc"
